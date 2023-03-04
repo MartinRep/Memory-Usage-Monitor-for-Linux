@@ -1,64 +1,59 @@
 #!/bin/bash
 
-# Set the search term to look for in process names
-search_term="wom"
+# Set the search term for processes to monitor
+SEARCH_TERM="init"
 
-# Set the log file path to save memory usage data
-log_path="/var/log/memory-usage.log"
+# Set the log file path
+LOG_FILE="./memory-usage.log"
 
-# Set the minimum disk space percentage to check for
-min_disk_space=3
+# Get the total system memory in KB
+MEM_TOTAL=$(grep 'MemTotal' /proc/meminfo | awk '{print $2}')
 
-# Function to check available disk space and stop script if below minimum threshold
-function check_disk_space {
-    # Get available disk space in bytes
-    available_space=$(df / | awk 'NR==2 {print $4}')
+# Initialize an empty array to store the previous memory usage for each process
+declare -A prev_mem_usage=()
 
-    # Get total disk space in bytes
-    total_space=$(df / | awk 'NR==2 {print $2}')
-
-    # Calculate available disk space percentage
-    available_percent=$((available_space * 100 / total_space))
-
-    # Check if available disk space is below minimum threshold
-    if [ $available_percent -lt $min_disk_space ]; then
-        echo "Stopping script - low disk space"
-        exit 1
-    fi
-}
-
-# Loop continuously until script is stopped
+# Loop indefinitely
 while true; do
-    # Get process IDs of processes containing search term
-    pids=$(pgrep $search_term)
+  # Get the current timestamp
+  TIMESTAMP=$(date +%s)
 
-    # Loop through each process and record memory usage
-    for pid in $pids; do
-        # Get process name
-        process_name=$(ps -p $pid -o comm=)
+  # Loop through all processes containing the search term
+  while read -r pid pname; do
+    # Get the current memory usage for the process
+    mem_usage=$(pmap -x "$pid" | tail -1 | awk '{print $3}')
+    mem_usage=${mem_usage/K/} # Remove the "K" at the end of the value
 
-        # Get memory usage in MB
-        memory_usage=$(pmap $pid | tail -1 | awk '{print $2}' | sed 's/K//' | awk '{print $1/1024}')
+    # If the process was found in a previous iteration, calculate the memory usage delta
+    if [[ ${prev_mem_usage[$pid]} ]]; then
+      mem_usage_delta=$(echo "$mem_usage - ${prev_mem_usage[$pid]}" | bc)
+      mem_usage_delta_pct=$(echo "scale=2; $mem_usage_delta / ${prev_mem_usage[$pid]} * 100" | bc)
+      mem_usage_delta_pct=${mem_usage_delta_pct/-/} # Remove the "-" sign from negative percentages
+    else
+      mem_usage_delta=0
+      mem_usage_delta_pct=0
+    fi
 
-        # Get current date and time
-        current_date=$(date +"%Y-%m-%d %H:%M:%S")
+    # Save the current memory usage as the previous memory usage for the next iteration
+    prev_mem_usage[$pid]=$mem_usage
 
-        # Save memory usage data to log file
-        echo "$current_date - $process_name - $memory_usage MB" >> $log_path
-    done
+    # Write the memory usage data to the log file
+    echo -e "${TIMESTAMP}\t${pid}\t${pname}\t${mem_usage}\t${mem_usage_delta}\t${mem_usage_delta_pct}" >> $LOG_FILE
+  done < <(pgrep -f $SEARCH_TERM | xargs -I{} sh -c 'echo "{} $(ps -p {} -o comm=)"')
 
-    # Calculate average memory usage of all processes
-    average_memory=$(pmap $(pgrep $search_term) | tail -1 | awk '{print $2}' | sed 's/K//' | awk '{s+=$1} END {print s/1024}')
+  # Calculate the average memory usage for each process and print the process with the biggest increase in memory usage
+  echo "Average Memory Usage:"
+  while read -r pname mem_usage mem_usage_delta mem_usage_delta_pct; do
+    mem_usage_pct=$(echo "scale=2; $mem_usage / $MEM_TOTAL * 100" | bc)
+    echo -e "${pname}\t${mem_usage}\t${mem_usage_pct}%\t${mem_usage_delta_pct}%"
+  done < <(awk -F '\t' '{a[$3]+=$4;b[$3]+=$5}END{for(i in a){print i"\t"a[i]/NR"\t"b[i]/NR}}' $LOG_FILE | sort -k3rn | head -n 1 | awk '{print $1, $2, $3, $4 " (biggest increase)"}')
 
-    # Get current date and time
-    current_date=$(date +"%Y-%m-%d %H:%M:%S")
+  # Check the available disk space and exit if it is below 3% of the total disk space
+  disk_usage_pct=$(df --output=pcent / | tail -1 | sed 's/%//')
+  if [[ $disk_usage_pct -gt 97 ]]; then
+    echo "Error: Low disk space. Exiting..."
+    exit 1
+  fi
 
-    # Save average memory usage data to log file
-    echo "$current_date - Average memory usage: $average_memory MB" >> $log_path
-
-    # Check available disk space and stop script if below minimum threshold
-    check_disk_space
-
-    # Wait for 60 seconds before starting next iteration
-    sleep 60
+  # Wait for 10 seconds before checking again
+  sleep 10
 done
